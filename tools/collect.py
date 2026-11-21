@@ -13,11 +13,12 @@ Crops are exactly what the model sees (the firmware preprocesses them), so
 training on them removes the camera/dataset mismatch.
 """
 import argparse
+import collections
 import csv
 import glob
-import os
 import pathlib
 import random
+import string
 import sys
 import time
 
@@ -29,7 +30,7 @@ except ImportError:
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 CSV = DATA / "crops.csv"
-ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+ALPHA = string.ascii_uppercase
 SHADES = " .:-=+*#%@"
 
 
@@ -72,10 +73,9 @@ def read_lines(s, until, timeout=15):
         if not raw:
             continue
         line = raw.decode(errors="replace").strip()
-        if line.startswith(until):
-            yield line
-            return
         yield line
+        if line.startswith(until):
+            return
 
 
 def snap(s, n):
@@ -115,37 +115,32 @@ def do_collect(a):
     s = open_port(a.port, a.baud)
     DATA.mkdir(exist_ok=True)
     new = not CSV.exists()
-    f = open(CSV, "a", newline="")
-    w = csv.writer(f)
-    if new:
-        w.writerow(["signer", "label", "letter"] + [f"pixel{i}" for i in range(784)])
     letters = a.letters.upper()
     print(f"Signer '{a.signer}': {len(letters)} letters x {a.n} crops.")
     print("For each letter: hold the sign in the frame and press Enter.")
     print("While it records, move a little: tilt, shift, closer/further. Variety = accuracy.")
     print("J and Z: hold the hand shape from the MIDDLE of the motion.\n")
-    i = 0
-    while i < len(letters):
-        L = letters[i]
-        ans = input(f"[{i + 1}/{len(letters)}] sign '{L}'  (Enter=record, s=skip, q=quit) ").strip().lower()
-        if ans == "q":
-            break
-        if ans == "s":
-            i += 1
-            continue
-        for c in "321":
-            print(c, end=" ", flush=True)
-            time.sleep(0.4)
-        print("recording...", end=" ", flush=True)
-        imgs = snap(s, a.n)
-        for px in imgs:
-            w.writerow([a.signer, ALPHA.index(L), L] + list(px))
-        f.flush()
-        print(f"got {len(imgs)}")
-        if imgs:
-            print(ascii_img(imgs[len(imgs) // 2]))
-        i += 1
-    f.close()
+    with open(CSV, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["signer", "label", "letter"] + [f"pixel{i}" for i in range(784)])
+        for i, L in enumerate(letters):
+            ans = input(f"[{i + 1}/{len(letters)}] sign '{L}'  (Enter=record, s=skip, q=quit) ").strip().lower()
+            if ans == "q":
+                break
+            if ans == "s":
+                continue
+            for c in "321":
+                print(c, end=" ", flush=True)
+                time.sleep(0.4)
+            print("recording...", end=" ", flush=True)
+            imgs = snap(s, a.n)
+            for px in imgs:
+                w.writerow([a.signer, ALPHA.index(L), L] + list(px))
+            f.flush()
+            print(f"got {len(imgs)}")
+            if imgs:
+                print(ascii_img(imgs[len(imgs) // 2]))
     print(f"saved to {CSV}")
 
 
@@ -154,14 +149,14 @@ def load_rows():
         r = csv.reader(f)
         next(r)
         for row in r:
-            yield row[0], row[2], bytes(int(v) for v in row[3:])
+            yield row[0], row[2], bytes(map(int, row[3:]))
 
 
 def do_sheet(a):
     rows = list(load_rows())
-    by = {}
+    by = collections.defaultdict(list)
     for signer, L, px in rows:
-        by.setdefault((L, signer), []).append(px)
+        by[(L, signer)].append(px)
     keys = sorted(by)
     cols = a.per
     H, W = len(keys) * 29, cols * 29
@@ -173,11 +168,8 @@ def do_sheet(a):
                 img[o:o + 28] = px[y * 28:(y + 1) * 28]
     out = DATA / "sheet.pgm"
     out.write_bytes(f"P5 {W} {H} 255\n".encode() + bytes(img))
-    counts = {}
-    for signer, L, _ in rows:
-        counts[signer] = counts.get(signer, 0) + 1
     print(f"wrote {out} (rows: {', '.join(f'{l}/{s}' for l, s in keys[:6])} ...)")
-    print("crops per signer:", counts)
+    print("crops per signer:", dict(collections.Counter(s for s, _, _ in rows)))
 
 
 def do_quiz(a):

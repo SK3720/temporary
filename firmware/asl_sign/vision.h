@@ -17,7 +17,18 @@ static const int IMG_PIXELS = IMG * IMG;
 static const int MAX_LABELS = 32;
 
 // ---------------------------------------------------------------- camera
+// The frame light follows the camera. LEDC channel 2 = timer 1; the camera's
+// XCLK uses channel 0 / timer 0.
 static bool g_cameraOn = false;
+static const int kLightChannel = 2;
+
+static void light(bool on) {
+#if LIGHT_PIN >= 0
+  static bool attached = false;
+  if (!attached) { ledcSetup(kLightChannel, 5000, 8); ledcAttachPin(LIGHT_PIN, kLightChannel); attached = true; }
+  ledcWrite(kLightChannel, on ? LIGHT_DUTY : 0);
+#endif
+}
 
 static bool camera_start() {
   if (g_cameraOn) return true;
@@ -34,7 +45,6 @@ static bool camera_start() {
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_GRAYSCALE;
   c.frame_size = FRAMESIZE_QQVGA;          // 160x120 is plenty for 28x28
-  c.jpeg_quality = 12;
   c.fb_count = 2;
   c.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   c.grab_mode = CAMERA_GRAB_LATEST;
@@ -48,8 +58,8 @@ static bool camera_start() {
   s->set_gain_ctrl(s, 1);
   s->set_whitebal(s, 1);
   s->set_vflip(s, CAM_VFLIP);
-  s->set_hmirror(s, CAM_HMIRROR);
   g_cameraOn = true;
+  light(true);
   // let auto-exposure settle
   for (int i = 0; i < 5; i++) {
     camera_fb_t* fb = esp_camera_fb_get();
@@ -62,6 +72,7 @@ static void camera_stop() {
   if (!g_cameraOn) return;
   esp_camera_deinit();          // frees frame buffers and I2S0 / LEDC0
   g_cameraOn = false;
+  light(false);
 }
 
 // ---------------------------------------------------------------- preprocess
@@ -135,16 +146,13 @@ static bool classifier_init() {
   if (!arena) arena = (uint8_t*)heap_caps_malloc(kArenaSize, MALLOC_CAP_SPIRAM);  // slower but works
   if (!arena) { Serial.println("ERR no memory for tensor arena"); return false; }
 
-  static tflite::MicroMutableOpResolver<9> ops;
+  // Exactly the ops the stock and fine-tuned models use (train_asl.py FIRMWARE_OPS).
+  static tflite::MicroMutableOpResolver<5> ops;
   ops.AddConv2D();
-  ops.AddDepthwiseConv2D();
   ops.AddMaxPool2D();
-  ops.AddAveragePool2D();
   ops.AddReshape();
   ops.AddFullyConnected();
   ops.AddSoftmax();
-  ops.AddQuantize();
-  ops.AddDequantize();
 
   static tflite::MicroInterpreter interp(model, ops, arena, kArenaSize, &reporter);
   if (interp.AllocateTensors() != kTfLiteOk) { Serial.println("ERR AllocateTensors"); return false; }
@@ -155,7 +163,7 @@ static bool classifier_init() {
     Serial.println("ERR model input must be int8 28x28x1");
     return false;
   }
-  if (g_out->dims->data[g_out->dims->size - 1] != kNumLabels || kNumLabels > MAX_LABELS) {
+  if (g_out->dims->data[g_out->dims->size - 1] != kNumLabels || kNumLabels < 2 || kNumLabels > MAX_LABELS) {
     Serial.println("ERR label count does not match model output");
     return false;
   }
@@ -187,10 +195,10 @@ static int classify(const uint8_t* img, float* probs) {
 
 // ---------------------------------------------------------------- burst vote
 struct Burst {
-  int label = -1;      // winning class (majority of per-frame argmax)
+  int label = -1;      // winning class (majority of per-frame argmax); -1 = no frames
   float conf = 0;      // mean probability of the winner over the burst
   int votes = 0, frames = 0;
-  int second = -1;     // runner-up by mean probability
+  int second = 0;      // runner-up by mean probability
   float secondConf = 0;
 };
 
@@ -201,23 +209,23 @@ static Burst capture_burst(int n) {
   float probs[MAX_LABELS];
   uint8_t img[IMG_PIXELS];
   for (int f = 0; f < n; f++) {
+    if (f) delay(BURST_GAP_MS);
     if (!grab_crop(img)) continue;
     int k = classify(img, probs);
     if (k < 0) continue;
     votes[k]++;
     for (int i = 0; i < kNumLabels; i++) sum[i] += probs[i];
     b.frames++;
-    delay(BURST_GAP_MS);
   }
   if (!b.frames) return b;
-  for (int i = 0; i < kNumLabels; i++) {
-    if (b.label < 0 || votes[i] > votes[b.label] ||
-        (votes[i] == votes[b.label] && sum[i] > sum[b.label])) b.label = i;
-  }
+  b.label = 0;
+  for (int i = 1; i < kNumLabels; i++)
+    if (votes[i] > votes[b.label] || (votes[i] == votes[b.label] && sum[i] > sum[b.label])) b.label = i;
+  b.second = b.label == 0 ? 1 : 0;
   for (int i = 0; i < kNumLabels; i++)
-    if (i != b.label && (b.second < 0 || sum[i] > sum[b.second])) b.second = i;
+    if (i != b.label && sum[i] > sum[b.second]) b.second = i;
   b.votes = votes[b.label];
   b.conf = sum[b.label] / b.frames;
-  b.secondConf = b.second >= 0 ? sum[b.second] / b.frames : 0;
+  b.secondConf = sum[b.second] / b.frames;
   return b;
 }

@@ -42,11 +42,7 @@ def main():
             if 1950 <= int(row["year"]) <= 2008:
                 score[row["name"].upper()] += float(row["percent"])
     us = [n for n, _ in score.most_common() if n.isalpha() and n.isascii()][:N_US]
-    names, seen = [], set()
-    for n in us + EXTRA:
-        if n not in seen and len(n) <= 12:
-            seen.add(n)
-            names.append(n)
+    names = [n for n in dict.fromkeys(us + EXTRA) if len(n) <= 12]
 
     body = []
     for i in range(0, len(names), 10):

@@ -17,7 +17,7 @@ The model and approach come from the organizers' recommended repo [1]. It's a Ke
 | `firmware/asl_sign/` | Arduino sketch. **Start in `config.h`.** |
 | `firmware/asl_sign/model_data.cpp` | Generated. It ships with the **stock 24-class model** from [1], so you can flash it right away. |
 | `firmware/asl_sign/speech_mode.h` | Paste the team's existing speech pipeline here. |
-| `firmware/asl_sign/speech_out.h` | Translate + TTS for finished words. Replace the body of `say_word()` if you already have a path. |
+| `firmware/asl_sign/speech_out.h` | Translate + TTS for finished words. If you already have a path, call it from `say_word()`, which already stops the camera around network calls. |
 | `tools/collect.py` | Serial tool: `preview`, `collect`, `sheet`, `quiz`. |
 | `training/train_asl.py`, `training/colab.ipynb` | Fine-tune, quantize to int8, write `model_data.cpp`. |
 | `tools/tflite_to_c.py` | `.tflite` → `model_data.cpp`, with the labels embedded. |

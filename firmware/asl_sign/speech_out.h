@@ -2,10 +2,12 @@
 // Word -> Google Translate -> LCD + speech (Cloud TTS, LINEAR16 -> MAX98357A).
 //
 // If your team already has a working Translate + TTS path from the speech
-// levels, replace the body of say_word() with a call to it and keep the
-// camera_stop()/camera_start() around it (classic ESP32 does not have the RAM
-// for camera + WiFi + TLS at once).
+// levels, call it from say_word() between the camera_stop()/camera_start()
+// that is already there (classic ESP32 does not have the RAM for camera +
+// WiFi + TLS at once).
 #include "config.h"
+#include "vision.h"
+#include "ui.h"
 #if USE_NETWORK
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -17,37 +19,43 @@
 #include "secrets.example.h"
 #endif
 
-static bool wifi_up(uint32_t timeoutMs = 10000) {
-  if (WiFi.status() == WL_CONNECTED) return true;
+static void network_begin() {        // non-blocking; connects in the background
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  uint32_t t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(100);
-  return WiFi.status() == WL_CONNECTED;
 }
 
-static String url_encode(const String& s) {
+static bool wifi_up() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);  // retry a failed / dropped connection
+  return WiFi.waitForConnectResult(10000) == WL_CONNECTED;
+}
+
+static String json_escape(const String& s) {
   String o;
-  const char* hex = "0123456789ABCDEF";
   for (size_t i = 0; i < s.length(); i++) {
-    uint8_t c = s[i];
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
-    else { o += '%'; o += hex[c >> 4]; o += hex[c & 15]; }
+    if (s[i] == '"' || s[i] == '\\') o += '\\';
+    o += s[i];
   }
   return o;
 }
 
+// POST a JSON body to a googleapis.com endpoint. Caller reads the response and calls http.end().
+static int google_post(HTTPClient& http, WiFiClientSecure& tls, const char* url, const String& body) {
+  tls.setInsecure();               // hackathon: skip cert pinning
+  http.setTimeout(15000);
+  if (!http.begin(tls, String(url) + "?key=" + GOOGLE_API_KEY)) return -1;
+  http.addHeader("Content-Type", "application/json");
+  return http.POST(body);
+}
+
 // Returns the translated text, or the input unchanged on failure / "en".
 static String translate_text(const String& text) {
-  if (String(TARGET_LANG) == "en") return text;
+  if (!strcmp(TARGET_LANG, "en")) return text;
   WiFiClientSecure tls;
-  tls.setInsecure();               // hackathon: skip cert pinning
   HTTPClient http;
-  String url = String("https://translation.googleapis.com/language/translate/v2?key=") +
-               GOOGLE_API_KEY + "&source=en&format=text&target=" + TARGET_LANG +
-               "&q=" + url_encode(text);
-  if (!http.begin(tls, url)) return text;
-  int code = http.GET();
+  int code = google_post(http, tls, "https://translation.googleapis.com/language/translate/v2",
+                         String("{\"q\":\"") + json_escape(text) + "\",\"source\":\"en\",\"target\":\"" +
+                         TARGET_LANG + "\",\"format\":\"text\"}");
   String body = code == 200 ? http.getString() : "";
   http.end();
   int k = body.indexOf("\"translatedText\"");
@@ -133,21 +141,12 @@ static void play_pcm16(const int16_t* s, size_t n) {
 
 static bool tts_speak(const String& text) {
   WiFiClientSecure tls;
-  tls.setInsecure();
   HTTPClient http;
-  http.setTimeout(15000);
-  if (!http.begin(tls, String("https://texttospeech.googleapis.com/v1/text:synthesize?key=") + GOOGLE_API_KEY))
-    return false;
-  http.addHeader("Content-Type", "application/json");
-  String esc;
-  for (size_t i = 0; i < text.length(); i++) {
-    if (text[i] == '"' || text[i] == '\\') esc += '\\';
-    esc += text[i];
-  }
-  String req = String("{\"input\":{\"text\":\"") + esc + "\"},\"voice\":{\"languageCode\":\"" +
-               TTS_LANG_CODE + "\"},\"audioConfig\":{\"audioEncoding\":\"LINEAR16\",\"sampleRateHertz\":" +
-               TTS_SAMPLE_RATE + "}}";
-  int code = http.POST(req);
+  int code = google_post(http, tls, "https://texttospeech.googleapis.com/v1/text:synthesize",
+                         String("{\"input\":{\"text\":\"") + json_escape(text) +
+                         "\"},\"voice\":{\"languageCode\":\"" + TTS_LANG_CODE +
+                         "\"},\"audioConfig\":{\"audioEncoding\":\"LINEAR16\",\"sampleRateHertz\":" +
+                         TTS_SAMPLE_RATE + "}}");
   if (code != 200) { Serial.printf("WARN TTS HTTP %d %s\n", code, http.getString().c_str()); http.end(); return false; }
   AudioSink sink(TTS_SAMPLE_RATE * 2 * 8);  // up to 8 s
   http.writeToStream(&sink);
@@ -161,19 +160,27 @@ static bool tts_speak(const String& text) {
   play_pcm16((const int16_t*)(sink.buf + off), (sink.len - off) / 2);
   return true;
 }
+#else
+static void network_begin() {}
 #endif  // USE_NETWORK
 
-// Called once per finished word (sign mode, after "done").
-// `show` is a callback that prints the (possibly translated) text on the LCD.
-static void say_word(const char* word, void (*show)(const char* text)) {
+// Called once per finished word: translate, show on LCD row 2, speak.
+static void say_word(const char* word) {
 #if USE_NETWORK
-  if (!wifi_up()) { Serial.println("WARN WiFi down - showing word only"); show(word); return; }
-  String spoken = translate_text(word);
-  show(spoken.c_str());
-  Serial.printf("SAY %s -> %s\n", word, spoken.c_str());
-  if (!tts_speak(spoken)) Serial.println("WARN speech failed");
+  bool cam = g_cameraOn;
+  camera_stop();                    // RAM for WiFi + TLS on classic ESP32
+  if (wifi_up()) {
+    String spoken = translate_text(word);
+    lcd_row(2, "> %s", spoken.c_str());
+    Serial.printf("SAY %s -> %s\n", word, spoken.c_str());
+    if (!tts_speak(spoken)) Serial.println("WARN speech failed");
+  } else {
+    Serial.println("WARN WiFi down - showing word only");
+    lcd_row(2, "> %s", word);
+  }
+  if (cam) camera_start();
 #else
-  show(word);
+  lcd_row(2, "> %s", word);
   Serial.printf("SAY %s\n", word);
 #endif
 }

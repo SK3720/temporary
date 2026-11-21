@@ -12,16 +12,21 @@ Architecture and normalisation (x/127.5 - 1) are the same as the upstream
 notebook: J. Randall, "American-Sign-language", GitHub, 2023.
 """
 import argparse
-import os
+import collections
 import pathlib
-import subprocess
+import string
 import sys
 
 import numpy as np
 import pandas as pd
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+sys.path.insert(0, str(ROOT / "tools"))
+from tflite_to_c import write_c  # noqa: E402
+
+ALPHA = string.ascii_uppercase
+# Ops registered in firmware/asl_sign/vision.h - keep the two lists in sync.
+FIRMWARE_OPS = {"CONV_2D", "MAX_POOL_2D", "RESHAPE", "FULLY_CONNECTED", "SOFTMAX"}
 
 
 # ------------------------------------------------------------------ data
@@ -126,17 +131,16 @@ def to_tflite(tf, model, rep_x, out_path):
 
 def tflite_predict(tf, data, x):
     it = tf.lite.Interpreter(model_content=data)
-    it.allocate_tensors()
-    i, o = it.get_input_details()[0], it.get_output_details()[0]
+    i = it.get_input_details()[0]
     s, zp = i["quantization"]
+    q = np.clip(np.round(x / s + zp), -128, 127).astype(np.int8)
+    it.resize_tensor_input(i["index"], q.shape)   # whole set in one invoke
+    it.allocate_tensors()
+    it.set_tensor(i["index"], q)
+    it.invoke()
+    out = it.get_tensor(it.get_output_details()[0]["index"])
     ops = {d["op_name"] for d in it._get_ops_details()}
-    preds = []
-    for k in range(len(x)):
-        q = np.clip(np.round(x[k:k + 1] / s + zp), -128, 127).astype(np.int8)
-        it.set_tensor(i["index"], q)
-        it.invoke()
-        preds.append(int(np.argmax(it.get_tensor(o["index"])[0])))
-    return np.array(preds), ops
+    return np.argmax(out, axis=1), ops
 
 
 def report(name, y_true, y_pred, labels):
@@ -147,11 +151,7 @@ def report(name, y_true, y_pred, labels):
         m = y_true == c
         per.append((labels[c], (y_pred[m] == c).mean(), m.sum()))
     print("   per letter:", " ".join(f"{l}:{100 * a:.0f}" for l, a, _ in per))
-    pairs = {}
-    for t, p in zip(y_true, y_pred):
-        if t != p:
-            pairs[(labels[t], labels[p])] = pairs.get((labels[t], labels[p]), 0) + 1
-    top = sorted(pairs.items(), key=lambda kv: -kv[1])[:8]
+    top = collections.Counter((labels[t], labels[p]) for t, p in zip(y_true, y_pred) if t != p).most_common(8)
     print("   top confusions:", ", ".join(f"{t}->{p} x{n}" for (t, p), n in top) or "none")
     return acc
 
@@ -184,9 +184,8 @@ def main():
     # Classes = every letter that has data (Sign MNIST gives 24, our crops add J/Z).
     present = sorted(set(ym.tolist()) | set(yc.tolist()))
     labels = "".join(ALPHA[c] for c in present)
-    remap = {c: i for i, c in enumerate(present)}
-    ym = np.array([remap[v] for v in ym], dtype=np.int64)
-    yc = np.array([remap[v] for v in yc], dtype=np.int64)
+    ym = np.searchsorted(present, ym).astype(np.int64)   # letter index -> output index
+    yc = np.searchsorted(present, yc).astype(np.int64)
     n = len(labels)
     print(f"[classes] {n}: {labels}")
     missing = set(ALPHA) - set(labels)
@@ -217,8 +216,9 @@ def main():
                   validation_data=dataset(tf, Xc_te, yc_te, 256, False, False), verbose=2)
 
     # Phase 2: adapt to our camera. Own crops repeated so they are ~half of each epoch.
-    reps = max(1, int(round(min(len(Xm), 20000) / max(1, len(Xc_tr)))))
-    keep = np.random.RandomState(a.seed).permutation(len(Xm))[:min(len(Xm), 20000)]
+    n_mnist = min(len(Xm), 20000)
+    reps = max(1, int(round(n_mnist / max(1, len(Xc_tr)))))
+    keep = np.random.RandomState(a.seed).permutation(len(Xm))[:n_mnist]
     Xmix = np.concatenate([np.repeat(Xc_tr, reps, 0), Xm[keep]])
     ymix = np.concatenate([np.repeat(yc_tr, reps, 0), ym[keep]])
     print(f"[finetune] {len(Xc_tr)} own crops x{reps} + {len(keep)} MNIST")
@@ -240,18 +240,15 @@ def main():
     q_pred, ops = tflite_predict(tf, data, Xc_te)
     acc = report(f"INT8 model, {title}", yc_te, q_pred, labels)
     print(f"\n[export] {tfl_path} ({len(data)} bytes), ops: {sorted(ops)}")
-    ok_ops = {"CONV_2D", "MAX_POOL_2D", "RESHAPE", "FULLY_CONNECTED", "SOFTMAX",
-              "DEPTHWISE_CONV_2D", "AVERAGE_POOL_2D", "QUANTIZE", "DEQUANTIZE", "DELEGATE"}
-    if ops - ok_ops:
-        print(f"[export] WARNING ops not registered in firmware: {ops - ok_ops}")
+    extra = ops - FIRMWARE_OPS - {"DELEGATE"}   # DELEGATE = desktop XNNPACK, not in the model
+    if extra:
+        print(f"[export] WARNING ops not registered in firmware: {extra}")
 
     if a.holdout:
         print(f"\nJudge number: {100 * acc:.0f}% per-frame accuracy on a signer the model never saw.")
         print("(Not writing model_data.cpp for a hold-out run; rerun without --holdout for the final model.)")
         return
-    subprocess.check_call([sys.executable, str(ROOT / "tools" / "tflite_to_c.py"), str(tfl_path),
-                           "--labels", labels, "--out", a.c_out,
-                           "--note", f"fine-tuned on {len(xc)} own crops + Sign MNIST"])
+    write_c(data, labels, a.c_out, f"fine-tuned on {len(xc)} own crops + Sign MNIST", tfl_path.name)
     print("\nNext: copy model_data.cpp into firmware/asl_sign/ and re-flash.")
 
 

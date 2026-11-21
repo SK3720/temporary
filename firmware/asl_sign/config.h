@@ -76,7 +76,6 @@
 #define MIRROR_X           0   // 1 = flip left/right before the model
 #define CONTRAST_STRETCH   1   // 1 = stretch 2nd..98th percentile to 0..255
 #define CAM_VFLIP          0
-#define CAM_HMIRROR        0
 
 // ---- 4. Letter commit ----------------------------------------------------
 #define BURST_FRAMES       5

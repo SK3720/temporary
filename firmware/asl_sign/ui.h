@@ -41,6 +41,7 @@ static BtnEvent buttons_poll() {
 }
 static const char* kHint = "tap=add 2x=del hold=ok";
 static const char* kChooseHint = "tap=name  2x=raw";
+static const char* kModeHint = "hold 3s = sign mode";
 #else
 static const int kPins[4] = {BTN_CAPTURE, BTN_BACK, BTN_DONE, BTN_MODE};
 static const BtnEvent kEv[4] = {EV_CAPTURE, EV_BACK, EV_DONE, EV_MODE};
@@ -66,6 +67,7 @@ static BtnEvent buttons_poll() {
 }
 static const char* kHint = "SIGN  DEL  DONE";
 static const char* kChooseHint = "SIGN=name  DEL=raw";
+static const char* kModeHint = "MODE = sign mode";
 #endif
 
 // ---------------------------------------------------------------- LCD
@@ -87,17 +89,14 @@ static void lcd_begin() {
 
 // Print one full row (padded/truncated to 20 chars). Non-ASCII -> '?'.
 static void lcd_row(int row, const char* fmt, ...) {
-  char buf[64];
+  if (!g_lcd) return;
+  char buf[64], line[21];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof buf, fmt, ap);
   va_end(ap);
-  if (!g_lcd) return;
-  char line[21];
-  int i = 0;
-  for (; i < 20 && buf[i]; i++) line[i] = (buf[i] >= 32 && buf[i] < 127) ? buf[i] : '?';
-  for (; i < 20; i++) line[i] = ' ';
-  line[20] = 0;
+  snprintf(line, sizeof line, "%-20.20s", buf);
+  for (char* c = line; *c; c++) if (*c < 32 || *c > 126) *c = '?';
   g_lcd->setCursor(0, row);
   g_lcd->print(line);
 }

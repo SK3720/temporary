@@ -11,7 +11,7 @@ static void speech_mode_enter() {
   lcd_row(0, "SPEECH MODE");
   lcd_row(1, "(pipeline goes in");
   lcd_row(2, " speech_mode.h)");
-  lcd_row(3, "hold/MODE = sign");
+  lcd_row(3, "%s", kModeHint);
 }
 
 static void speech_mode_loop() {}
