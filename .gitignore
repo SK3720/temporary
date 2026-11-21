@@ -1,0 +1,5 @@
+firmware/asl_sign/secrets.h
+data/
+*.pyc
+__pycache__/
+build/
